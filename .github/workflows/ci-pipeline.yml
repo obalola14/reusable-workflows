@@ -1,0 +1,191 @@
+name: my-first-workflow
+
+on:
+  workflow_call: #this makes it reusable, only triggered by calls from other worklflows
+    secrets: #below secrets are required
+      SONAR_TOKEN:
+        required: true
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_ACCESS_TOKEN:
+        required: true
+jobs:
+  unit-tests:
+    name: Running Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5.0.0
+      - name: Setup Python
+        uses: actions/setup-python@v6.0.0
+        with:
+          python-version: '3.10'
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Unit Tests
+        run: |
+          mkdir reports/
+          pytest --junitxml=reports/test-results.xml --cov=. --cov-report=xml:reports/coverage.xml --cov-report=term-missing -v 
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v5.0.0 #allows us to upload artifacts generated during the workflow, such as test reports, logs, or build outputs
+        with:
+          name: unit-test-reports
+          path: reports/ #path to upload from
+
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions: #locks down permissions for the workflow, only allowing what is necessary for the workflow to run
+      actions: read # Required to run the workflow, Allows the workflow to read the repository's code and metadata
+      contents: read #Allolows workflow to read repo files and clone repo
+      security-events: write # Required to upload the results of the CodeQL analysis
+    
+    strategy: 
+      matrix: #FOR LOOP; this can be used to run the same job multiple times #Repetition if we have multiple values 
+        language: ['python'] 
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5.0.0
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+        with: 
+          category: "security"
+
+  sonarqube:
+    name: SonarQube
+    runs-on: ubuntu-latest
+    needs: unit-tests    #ensures that the SonarQube analysis only runs after the unit tests have completed successfully
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+
+      - name: Download Coverage Report
+        uses: actions/download-artifact@v5.0.0
+        with:
+          name: unit-test-reports
+          path: reports/ #download those unit test results from previous job here, works to download uploaded artifacts
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  
+      #This step fails or passes job based on Security Gate. Go to sonarqube check the quality gate info and update here, pass or fail the workflow based on the quality gate status
+      - name: Sonarqube Quality Gate Check
+        uses: SonarSource/sonarqube-quality-gate-action@v1.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    needs: [codeql, sonarqube] #ensures that the build job only runs after the Sonar
+    if: success() 
+    #ensures that the build job only runs if the previous jobs (codeql and sonarqube) were successful
+    
+    outputs:
+      image-tags: ${{ steps.vars.outputs.IMAGE_TAGS }} #this allows us to reference the IMAGE_TAGS value saved in the $GITHUB_OUTPUT in other jobs if needed
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5.0.0
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3.0.0
+      - name: Generate Image tags
+        id: vars #we gave this step an ID so that we can reference it later in the workflow
+        run: | #github.run_id is a unique identifier for each workflow run, and GITHUB_SHA is the full commit SHA of the commit that triggered the workflow. We used the frst 7 characters. By using these two values, we can create a unique tag for our Docker image that includes both the run ID and a shortened version of the commit SHA.
+          IMAGE_TAGS="${{ github.run_id }}-${GITHUB_SHA::7}"  
+          echo "IMAGE_TAGS=$IMAGE_TAGS" >> $GITHUB_OUTPUT
+#We created a variable IMAGE_TAGS and saved into $GITHUB_OUTPUT so that we can reuse it. Outputs variable in this step so other steps can use it.
+#$GITHUB_OUTPUT is a special file in GitHub Actions that lets a step send output values to later steps in the same job.
+      - name: Build Image (no push)
+        uses: docker/build-push-action@v5.0.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: thinknyx_app:${{ steps.vars.outputs.IMAGE_TAGS }} #we refrenece $GITHUB_OUTPUT value here
+          load: true #this will load the built image into the local Docker cache, allowing us to save it as a tar file in the next step
+
+      - name: Save Docker Image
+        run: docker save thinknyx_app:${{ steps.vars.outputs.IMAGE_TAGS }} -o thinknyx_app.tar
+
+      - name: Upload Docker Image Artifact
+        uses: actions/upload-artifact@v5.0.0
+        with: 
+          name: thinknyx_app_image
+          path: thinknyx_app.tar
+
+  publish-dockerhub:
+    name: Publish to Docker Hub
+    runs-on: ubuntu-latest
+    needs: build
+    if: success() 
+    steps:
+      - name: Download Docker Image Artifact
+        uses: actions/download-artifact@v5.0.0
+        with:
+          name: thinknyx_app_image
+          path: .
+
+      - name: Load Docker Image
+        run: docker load -i thinknyx_app.tar
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
+      - name: Tag Image #we need to tag the image with the repository name before pushing to docker hub, we can use the same tag we generated in the build job. Repo name is in format of username/repository:tag
+        run: |
+          IMAGE_TAG="${{ needs.build.outputs.image-tags }}"
+          docker image tag thinknyx_app:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/thinknyx_app:$IMAGE_TAG
+          
+      - name: Push Image
+      #reference the same IMAGE_TAG now using needs.build.outputs.image-tags because we are in a different job, we need to use needs to reference the output value from the build job
+        run: |
+          IMAGE_TAG="${{ needs.build.outputs.image-tags }}" 
+          docker image push ${{ secrets.DOCKERHUB_USERNAME }}/thinknyx_app:$IMAGE_TAG
+
+  publish-ghcr:
+    name: Publish to GitHub Container Registry
+    runs-on: ubuntu-latest
+    needs: build
+    if: success() 
+    permissions: 
+      contents: read #Allows workflow to read repo files and clone repo
+      packages: write #Required to publish to GHCR
+    steps:
+      - name: Download Docker Image Artifact
+        uses: actions/download-artifact@v5.0.0
+        with:
+          name: thinknyx_app_image
+          path: .
+
+      - name: Load Docker Image
+        run: docker load -i thinknyx_app.tar
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }} #github.actor is a default variable in GitHub Actions that represents the username of the person or app that triggered the workflow. 
+          password: ${{ secrets.GITHUB_TOKEN}} #GITHUB_TOKEN is a special secret that is generated on the fly to use in workflow, push to GHCR, Create realease, add comments, create issues
+      - name: Tag Image
+        run: |
+          IMAGE_TAG="${{ needs.build.outputs.image-tags }}"
+          docker image tag thinknyx_app:$IMAGE_TAG ghcr.io/${{ github.repository_owner }}/thinknyx_app:$IMAGE_TAG
+          
+      - name: Push Image
+      #reference the same IMAGE_TAG now using needs.build.outputs.image-tags because we are in a different job, we need to use needs to reference the output value from the build job
+        run: |
+          IMAGE_TAG="${{ needs.build.outputs.image-tags }}" 
+          docker image push ghcr.io/${{ github.repository_owner }}/thinknyx_app:$IMAGE_TAG
