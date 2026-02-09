@@ -3,7 +3,7 @@ name: my-first-workflow
 on:
   workflow_call: #this makes it reusable, only triggered by calls from other worklflows
     inputs: #used to decide which jobs to run when called
-      run_unit_tests:
+      run_unit_tests: #attributes for unit_tests job
         description: "Run Unit Tests"
         required: false
         default: true
@@ -34,7 +34,7 @@ on:
         default: false
         type: boolean
         
-    secrets: #below secrets are required
+    secrets: #below secrets are required when calling this workflow, insert into workflow calling this
       SONAR_TOKEN:
         required: true
       DOCKERHUB_USERNAME:
@@ -43,7 +43,7 @@ on:
         required: true
 jobs:
   unit-tests:
-    if: ${{ inputs.run_unit_tests }} #only runs if the value is true, it is set to tue by default, so will run
+    if: ${{ inputs.run_unit_tests }} #only runs if the value is true, it is set to true by default, so will run
     name: Running Unit Tests
     runs-on: ubuntu-latest
     steps:
