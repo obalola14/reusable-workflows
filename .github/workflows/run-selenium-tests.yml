@@ -8,7 +8,7 @@ on:
         type: string
 
 jobs:        
-  test:
+  run-test:
     environment: ${{ inputs.ENVIRONMENT }}
     runs-on: github-actions-scaleset-demo
     steps:
